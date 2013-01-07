@@ -10,7 +10,7 @@ Vcs-Browser: http://git.kali.org/gitweb/?p=packages/patator.git;a=summary
 
 Package: patator
 Architecture: all
-Depends: ${misc:Depends}, python, python-support python-paramiko, python-pycurl, libldap-2.4-2, python-impacket, python-mysqldb, python-psycopg2, python-pycryptopp, python-crypto, python-dns, python-pysnmp4, python-pyasn1, python-ipy, unzip, default-jre
+Depends: ${misc:Depends}, python, python-support, python-paramiko, python-pycurl, libldap-2.4-2, python-impacket, python-mysqldb, python-psycopg2, python-pycryptopp, python-crypto, python-dns, python-pysnmp4, python-pyasn1, python-ipy, unzip, default-jre
 Description: Multi-purpose brute-forcer
  Patator is a multi-purpose brute-forcer, with a modular 
  design and a flexible usage.
