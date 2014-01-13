@@ -1,3 +1,9 @@
+patator (0.4-1kali1) kali; urgency=low
+
+  * Updated watch file
+
+ -- Mati Aharoni <muts@kali.org>  Sun, 12 Jan 2014 19:30:24 -0500
+
 patator (0.4-1kali0) kali; urgency=low
 
   * Initial release 

@@ -1,0 +1,4 @@
+version=3
+
+https://code.google.com/p/patator/downloads/list .*/patator_v(\d[\d.]*)\.(?:tgz|tbz2|py|txz|tar\.gz|tar\.bz2|tar\.xz)
+
