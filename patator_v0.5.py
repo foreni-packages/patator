@@ -15,7 +15,8 @@ __author__  = 'Sebastien Macke'
 __email__   = 'patator@hsc.fr'
 __url__     = 'http://www.hsc.fr/ressources/outils/patator/'
 __git__     = 'http://code.google.com/p/patator/'
-__version__ = '0.4'
+__twitter__ = 'http://twitter.com/lanjelot'
+__version__ = '0.5'
 __license__ = 'GPLv2'
 __banner__  = 'Patator v%s (%s)' % (__version__, __git__)
  
@@ -48,6 +49,7 @@ Currently it supports the following modules:
   - mssql_login   : Brute-force MSSQL
   - oracle_login  : Brute-force Oracle
   - mysql_login   : Brute-force MySQL
+  - mysql_queries : Brute-force MySQL queries
   - pgsql_login   : Brute-force PostgreSQL
   - vnc_login     : Brute-force VNC
 
@@ -85,8 +87,8 @@ FEATURES
       + not limited to brute-forcing (eg. remote exploit testing, or vulnerable version probing)
 
   * Interactive runtime
-      + show verbose progress
-      + pause/unpause execution
+      + show progress during execution (press Enter)
+      + pause/unpause execution (press p)
       + increase/decrease verbosity
       + add new actions & conditions during runtime (eg. to exclude more types of response from showing)
       + ... press h to see all available interactive commands
@@ -97,9 +99,11 @@ FEATURES
 
   * Flexible user input
     - Any module parameter can be fuzzed:
-      + use FILE[0-9] keywords to iterate on a file
-      + use COMBO[0-9] keywords to iterate on the combo entries of a file
-      + use NET[0-9] keywords to iterate on every host of a network subnet
+      + use the FILE keyword to iterate over a file
+      + use the COMBO keyword to iterate over a combo file
+      + use the NET keyword to iterate over every hosts of a network subnet
+      + use the RANGE keyword to iterate over hexadecimal, decimal or alphabetical ranges
+      + use the PROG keyword to iterage over the output of an external program
 
     - Iteration over the joined wordlists can be done in any order
 
@@ -119,7 +123,7 @@ pycurl           | HTTP           | http://pycurl.sourceforge.net/              
 --------------------------------------------------------------------------------------------------
 openldap         | LDAP           | http://www.openldap.org/                           |  2.4.24 |
 --------------------------------------------------------------------------------------------------
-impacket         | SMB            | http://code.google.com/p/impacket/                 | svn#525 |
+impacket         | SMB            | http://code.google.com/p/impacket/                 | svn#765 |
 --------------------------------------------------------------------------------------------------
 cx_Oracle        | Oracle         | http://cx-oracle.sourceforge.net/                  |   5.1.1 |
 --------------------------------------------------------------------------------------------------
@@ -210,6 +214,12 @@ Scan subnets to just grab version banners.
 ---------
 ./module host=NET0 0=10.0.1.0/24,10.0.2.0/24,10.0.3.128-10.0.3.255
 
+Fuzzing a parameter by iterating over a range of values.
+---------
+./module param=RANGE0 0=hex:0x00-0xffff
+./module param=RANGE0 0=int:0-500
+./module param=RANGE0 0=lower:a-zzz
+
 
 * Actions & Conditions
 
@@ -234,8 +244,8 @@ instance. A failure is actually an exception that the module does not expect,
 and as a result the exception is caught upstream by the controller.
 
 Such exceptions, or failures, are not immediately reported to the user, the
-controller will retry 4 more times before reporting the failed payload with the
-code "xxx" (--max-retries defaults to 4).
+controller will retry 4 more times (see --max-retries) before reporting the
+failed payload with logging level "FAIL".
 
 
 * Read carefully the following examples to get a good understanding of how patator works.
@@ -263,12 +273,12 @@ ftp_login host=NET0 user=anonymous password=test@example.com 0=10.0.0.0/24
 
 }}}
 {{{ SSH
-* Brute-force authentication. Do not report wrong passwords.
+* Brute-force authentication with password same as login (aka single mode). Do not report wrong passwords.
 ---------
 ssh_login host=10.0.0.1 user=FILE0 password=FILE0 0=logins.txt -x ignore:mesg='Authentication failed.'
 
 NB. If you get errors like "Error reading SSH protocol banner ... Connection reset by peer",
-    try decreasing the max_conn option (default is 10), the server may be enforcing a maximum
+    try decreasing the number of threads, the server may be enforcing a maximum
     number of concurrent connections (eg. MaxStartups in OpenSSH).
 
 
@@ -543,6 +553,14 @@ unzip_pass zipfile=path/to/file.zip password=FILE0 0=passwords.txt -x ignore:cod
 CHANGELOG
 ---------
 
+* v0.5 2013/07/05
+  - new modules: mysql_query, tcp_fuzz
+  - new RANGE and PROG keywords (supersedes the reading from stdin feature)
+  - switched to impacket for mssql_login
+  - output more intuitive
+  - fixed connection cache
+  - minor bug fixes
+
 * v0.4 2012/11/02
   - new modules: smb_lookupsid, finger_lookup, pop_login, imap_login, vmauthd_login
   - improved connection cache
@@ -572,12 +590,14 @@ TODO
 ----
   * new option -e ns like in Medusa (not likely to be implemented due to design)
   * replace dnspython|paramiko|IPy with a better module (scapy|libssh2|... ?)
+  * use impacket/enum_lookupsids to automatically get the sid
 '''
 
 # }}}
 
 # logging {{{
 import logging
+logging._levelNames[logging.ERROR] = 'FAIL'
 class MyLoggingFormatter(logging.Formatter):
 
   dft_fmt = '%(asctime)s %(name)-7s %(levelname)7s - %(message)s'
@@ -605,13 +625,14 @@ logger.addHandler(handler)
 # imports {{{
 import re
 import os
-from sys import stdin, exc_info, exit, version_info
+from sys import exc_info, exit, version_info, maxint
 from time import localtime, strftime, sleep, time
 from functools import reduce
-from threading import Thread, active_count, Lock
+from threading import Thread, active_count
 from select import select
-from itertools import product, chain, islice
-from string import ascii_lowercase
+from itertools import islice
+import string
+import random
 from binascii import hexlify
 from base64 import b64encode
 from datetime import timedelta, datetime
@@ -659,21 +680,19 @@ def which(program):
 
   return None
 
-def create_dir(top_path, from_stdin=False):
+def create_dir(top_path):
   top_path = os.path.abspath(top_path)
   if os.path.isdir(top_path):
     files = os.listdir(top_path)
     if files:
-      if not from_stdin:
-        if raw_input("Directory '%s' is not empty, do you want to wipe it ? [Y/n]: " % top_path) == 'n':
-          exit(0)
-      for root, dirs, files in os.walk(top_path):
-        if dirs:
-          print("Directory '%s' contains sub-directories, safely aborting..." % root)
-          exit(0)
-        for f in files:
-          os.unlink(os.path.join(root, f))
-        break
+      if raw_input("Directory '%s' is not empty, do you want to wipe it ? [Y/n]: " % top_path) != 'n':
+        for root, dirs, files in os.walk(top_path):
+          if dirs:
+            print("Directory '%s' contains sub-directories, safely aborting..." % root)
+            exit(0)
+          for f in files:
+            os.unlink(os.path.join(root, f))
+          break
   else:
     os.mkdir(top_path)
   return top_path
@@ -703,6 +722,135 @@ def md5hex(plain):
 def sha1hex(plain):
   return hashlib.sha1(plain).hexdigest()
 
+# I rewrote itertools.product to avoid memory over-consumption when using large wordlists
+def product(xs, *rest):
+  if len(rest) == 0:
+    for x in xs():
+      yield [x]
+  else:
+    for head in xs():
+      for tail in product(*rest):
+        yield [head] + tail
+
+def chain(*iterables):
+  def xs():
+    for iterable in iterables:
+      for element in iterable:
+        yield element
+  return xs
+
+class FileIter:
+  def __init__(self, filename):
+    self.filename = filename
+
+  def __iter__(self):
+    return open(self.filename)
+
+# These are examples. You can easily write your own iterator to fit your needs.
+# Or using the PROG keyword, you can call an external program such as:
+#   - seq(1) from coreutils
+#   - http://hashcat.net/wiki/doku.php?id=maskprocessor
+#   - john -stdout -i
+# For instance:
+# $ ./dummy_test data=PROG0 0='seq 1 80'
+# $ ./dummy_test data=PROG0 0='mp64.bin ?l?l?l',$(mp64.bin --combination ?l?l?l)
+class HexIntRangeIter:
+  def __init__(self, typ, rng, random=None): #random.Random()):
+    r = rng.split('-')
+
+    if typ == 'hex':
+      self.fmt = '%x'
+      self.mn = int(r[0], 16)
+      self.mx = int(r[1], 16)
+
+    elif typ in ('int', 'digits'):
+      self.fmt = '%d'
+      c = rng.count('-')
+
+      if c == 1: # 1-50
+        self.mn = int(r[0])
+        self.mx = int(r[1])
+
+      elif c == 2: # -50-50
+        self.mn = int(r[1]) * -1
+        self.mx = int(r[2])
+
+      elif c == 3: # -50--25
+        self.mn = int(r[1]) * -1
+        self.mx = int(r[3]) * -1
+
+        if self.mn > self.mx:
+          self.mn, self.mx = self.mx, self.mn
+
+      else:
+        raise NotImplementedError("Unsupported range '%s'" % rng)
+
+    self.cur = self.mn
+    self.random = random
+
+  def __iter__(self):
+    return self
+
+  def next(self):
+    if self.random:
+      val = self.random.randint(self.mn, self.mx)
+      return self.fmt % val
+
+    else:
+      if self.cur > self.mx:
+        raise StopIteration
+
+      ret = self.fmt % self.cur
+      self.cur += 1
+
+      return ret
+
+  def __len__(self):
+    if self.random:
+      return maxint
+    else:
+      return self.mx - self.mn + 1
+
+def letterrange(first, last, charset):
+  for k in range(len(last)):
+    for x in product(*[chain(charset)]*(k+1)):
+      result = ''.join(x)
+      if first:
+        if first != result:
+          continue
+        else:
+          first = None
+      yield result
+      if result == last:
+        return
+
+class LetterRangeIter:
+  def __init__(self, typ, rng):
+    self.first, self.last = rng.split('-')
+    if typ == 'letters':
+      self.charset = [c for c in string.letters]
+    elif 'lower' in typ:
+      self.charset = [c for c in string.lowercase]
+    elif 'upper' in typ:
+      self.charset = [c for c in string.uppercase]
+    else:
+      raise NotImplementedError("Incorrect type '%s'" % typ)
+
+  def __iter__(self):
+    return letterrange(self.first, self.last, self.charset)
+
+  def __len__(self):
+    def count(f):
+      total = 0
+      i = 0
+      for c in f[::-1]:
+        z = self.charset.index(c) + 1
+        total += (len(self.charset)**i)*z
+        i += 1
+      return total + 1
+
+    return count(self.last) - count(self.first) + 1
+
 # }}}
 
 # Controller {{{
@@ -711,7 +859,7 @@ class Controller:
   builtin_actions = (
     ('ignore', 'do not report'),
     ('retry', 'try payload again'),
-    ('free', 'dismiss future types of payloads'),
+    ('free', 'dismiss future similar payloads'),
     ('quit', 'terminate execution now'),
     )
 
@@ -737,6 +885,12 @@ class Controller:
 
   def find_module_keys(self, value):
     return map(int, re.findall(r'MOD(\d)', value))
+
+  def find_range_keys(self, value):
+    return map(int, re.findall(r'RANGE(\d)', value))
+
+  def find_prog_keys(self, value):
+    return map(int, re.findall(r'PROG(\d)', value))
 
   def usage_parser(self, name):
     from optparse import OptionParser
@@ -851,10 +1005,9 @@ Please read the README inside for more examples and usage information.
     self.actions = {}
     self.free_list = []
     self.paused = False
-    self.from_stdin = False
     self.start_time = 0
     self.total_size = 1
-    self.stop_now = False
+    self.quit_now = False
     self.log_dir = None
     self.thread_report = []
     self.thread_progress = []
@@ -881,9 +1034,6 @@ Please read the README inside for more examples and usage information.
 
         if k.isdigit():
           wlists[k] = v
-
-          if v == '-':
-            self.from_stdin = True
 
         else:
           if v.startswith('@'):
@@ -931,7 +1081,19 @@ Please read the README inside for more examples and usage information.
               self.iter_keys[i][2].append(k)
 
             else:
-              self.payload[k] = v
+              for i in self.find_range_keys(v):
+                if i not in self.iter_keys:
+                  self.iter_keys[i] = ('RANGE', iter_vals[i], [])
+                self.iter_keys[i][2].append(k)
+
+              else:
+                for i in self.find_prog_keys(v):
+                  if i not in self.iter_keys:
+                    self.iter_keys[i] = ('PROG', iter_vals[i], [])
+                  self.iter_keys[i][2].append(k)
+
+                else:
+                  self.payload[k] = v
 
     logger.debug('iter_keys: %s' % self.iter_keys) # { 0: ('NET', '10.0.0.0/24', ['host']), 1: ('COMBO', 'combos.txt', [(0, 'user'), (1, 'password')]), 2: ('MOD', 'TLD', ['name'])
     logger.debug('enc_keys: %s' % self.enc_keys) # [('password', 'ENC', hexlify), ('header', 'B64', b64encode), ...
@@ -948,11 +1110,11 @@ Please read the README inside for more examples and usage information.
     if opts.auto_log:
       self.log_dir = create_time_dir(opts.log_dir or '/tmp/patator', opts.auto_log)
     elif opts.log_dir:
-      self.log_dir = create_dir(opts.log_dir, self.from_stdin)
+      self.log_dir = create_dir(opts.log_dir)
     
     if self.log_dir:
       log_file = os.path.join(self.log_dir, 'RUNTIME.log')
-      with open(log_file, 'w') as f:
+      with open(log_file, 'a') as f:
         f.write('$ %s\n' % ' '.join(argv))
 
       handler = logging.FileHandler(log_file)
@@ -1015,26 +1177,20 @@ Please read the README inside for more examples and usage information.
     logger.info('Starting %s at %s' % (__banner__, strftime('%Y-%m-%d %H:%M %Z', localtime())))
 
     try:
-      tryok = False
       self.start_threads()
       self.monitor_progress()
-      tryok = True
-    except SystemExit:
-      logger.info('Quitting')
     except KeyboardInterrupt:
-      print
+      self.quit_now = True
     except:
+      self.quit_now = True
       logger.exception(exc_info()[1])
 
-    if not tryok:
-      self.stop_now = True
-      try:
-        while active_count() > 1:
-          sleep(.1)
-      except KeyboardInterrupt:
-        pass
-
-    self.report_progress()
+    try:
+      while active_count() > 1:
+        sleep(.1)
+      self.report_progress()
+    except KeyboardInterrupt:
+      pass
 
     hits_count = sum(p.hits_count for p in self.thread_progress)
     done_count = sum(p.done_count for p in self.thread_progress)
@@ -1044,11 +1200,8 @@ Please read the README inside for more examples and usage information.
     total_time = time() - self.start_time
     speed_avg = done_count / total_time 
 
-    if self.from_stdin:
-      if tryok:
-        self.total_size = done_count+skip_count
-      else:
-        self.total_size = -1
+    if self.total_size >= maxint:
+      self.total_size = -1
 
     self.show_final()
 
@@ -1056,7 +1209,7 @@ Please read the README inside for more examples and usage information.
       hits_count, done_count, skip_count, fail_count, self.total_size, speed_avg,
       pprint_seconds(total_time, '%dh %dm %ds')))
 
-    if not tryok:
+    if self.quit_now:
       resume = []
       for i, p in enumerate(self.thread_progress):
         c = p.done_count + p.skip_count
@@ -1085,7 +1238,7 @@ Please read the README inside for more examples and usage information.
 
     # consumers
     for num in range(self.num_threads):
-      pqueue = Queue()
+      pqueue = Queue(maxsize=1000)
       t = Thread(target=self.consume, args=(gqueues[num], pqueue))
       t.daemon = True
       t.start()
@@ -1099,33 +1252,6 @@ Please read the README inside for more examples and usage information.
 
   def produce(self, queues):
 
-    if self.from_stdin:
-      from itertools import product, chain
-
-    else:
-      def product(xs, *rest):
-        if len(rest) == 0:
-          for x in xs():
-            yield [x]
-        else:
-          for head in xs():
-            for tail in product(*rest):
-              yield [head] + tail
-
-      def chain(*iterables):
-        def xs():
-          for iterable in iterables:
-            for element in iterable:
-              yield element
-        return xs
-
-    class FileIter:
-      def __init__(self, filename):
-        self.filename = filename
-
-      def __iter__(self):
-        return open(self.filename)
-
     iterables = []
     for _, (t, v, _) in self.iter_keys.items():
 
@@ -1134,15 +1260,9 @@ Please read the README inside for more examples and usage information.
         files = []
 
         for fname in v.split(','):
-          if fname == '-': # stdin
-            from sys import maxint
-            size += maxint
-            files.append(stdin)
-
-          else:
-            fpath = os.path.expanduser(fname)
-            size += sum(1 for _ in open(fpath))
-            files.append(FileIter(fpath))
+          fpath = os.path.expanduser(fname)
+          size += sum(1 for _ in open(fpath))
+          files.append(FileIter(fpath))
 
         iterable = chain(*files)
 
@@ -1155,11 +1275,43 @@ Please read the README inside for more examples and usage information.
         elements, size = self.module.available_keys[v]()
         iterable = chain(elements)
 
+      elif t == 'RANGE':
+        typ, opt = v.split(':', 1)
+        logger.debug('typ: %s, opt: %s' % (typ, opt))
+
+        if typ in ['hex', 'int', 'digits']:
+          it = HexIntRangeIter(typ, opt)
+          size = len(it)
+
+        elif typ in ['letters', 'lower', 'lowercase', 'upper', 'uppercase']:
+          it = LetterRangeIter(typ, opt)
+          size = len(it)
+
+        else:
+          raise NotImplementedError("Incorrect range type '%s'" % typ)
+
+        iterable = chain(it)
+
+      elif t == 'PROG':
+        m = re.match(r'(.+),(\d+)$', v)
+        if m:
+          prog, size = m.groups()
+        else:
+          prog, size = v, maxint
+
+        logger.debug('prog: %s, size: %s' % (prog, size))
+
+        p = subprocess.Popen(prog.split(' '), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        iterable, size = chain(p.stdout), int(size)
+
       else:
         raise NotImplementedError("Incorrect keyword '%s'" % t)
 
       self.total_size *= size
       iterables.append(iterable)
+
+    if not iterables:
+      iterables.append(chain(['']))
 
     if self.stop:
       self.total_size = self.stop - self.start 
@@ -1171,8 +1323,8 @@ Please read the README inside for more examples and usage information.
       self.total_size -= sum(self.resume)
 
     logger.info('')
-    logger.info('%-15s | %-25s \t | %5s | %s' % ('code & size', 'candidate', 'num', 'mesg'))
-    logger.info('-' * 63)
+    logger.info(self.module.Response.logformat % self.module.Response.logheader)
+    logger.info('-' * 70)
 
     self.start_time = time()
     count = 0
@@ -1186,12 +1338,12 @@ Please read the README inside for more examples and usage information.
         off = self.resume[idx]
 
         if count < off * len(self.resume):
-          logger.debug('Skipping %d %s, resume[%d]: %s' % (count, ':'.join(prod), idx, self.resume[idx]))
+          #logger.debug('Skipping %d %s, resume[%d]: %s' % (count, ':'.join(prod), idx, self.resume[idx]))
           count += 1
           continue
 
       while True:
-        if self.stop_now:
+        if self.quit_now:
           return
 
         try:
@@ -1214,11 +1366,16 @@ Please read the README inside for more examples and usage information.
         module.__del__()
 
     while True:
-      if self.stop_now:
+      if self.quit_now:
         shutdown()
         return
 
-      prod = gqueue.get()
+      try:
+        prod = gqueue.get_nowait()
+      except Empty:
+        sleep(.1)
+        continue
+
       if prod is None:
         shutdown()
         return
@@ -1238,6 +1395,12 @@ Please read the README inside for more examples and usage information.
         elif t == 'MOD':
           for k in keys:
             payload[k] = payload[k].replace('MOD%d' %i, prod[i])
+        elif t == 'RANGE':
+          for k in keys:
+            payload[k] = payload[k].replace('RANGE%d' %i, prod[i])
+        elif t == 'PROG':
+          for k in keys:
+            payload[k] = payload[k].replace('PROG%d' %i, prod[i])
 
       for k, m, e in self.enc_keys:
         payload[k] = re.sub(r'{0}(.+?){0}'.format(m), lambda m: e(m.group(1)), payload[k])
@@ -1246,7 +1409,7 @@ Please read the README inside for more examples and usage information.
       pp_prod = ':'.join(prod)
 
       if self.check_free(payload):
-        pqueue.put_nowait(('skip', pp_prod, None, 0))
+        pqueue.put(('skip', pp_prod, None, 0))
         continue
 
       try_count = 0
@@ -1254,16 +1417,15 @@ Please read the README inside for more examples and usage information.
 
       while True:
 
-        while self.paused and not self.stop_now:
+        while self.paused and not self.quit_now:
           sleep(1)
 
-        if self.stop_now:
+        if self.quit_now:
           shutdown()
           return
 
         if self.rate_limit:
           sleep(self.rate_limit)
-
 
         if try_count <= self.max_retries or self.max_retries < 0:
 
@@ -1287,13 +1449,14 @@ Please read the README inside for more examples and usage information.
             if hasattr(module, 'reset'):
               module.reset()
 
+            sleep(try_count * .1)
             continue
 
         else:
           actions = {'fail': None}
 
         actions.update(self.lookup_actions(resp))
-        pqueue.put_nowait((actions, pp_prod, resp, time() - start_time))
+        pqueue.put((actions, pp_prod, resp, time() - start_time))
 
         for name in self.module_actions:
           if name in actions:
@@ -1312,21 +1475,19 @@ Please read the README inside for more examples and usage information.
         break
        
   def monitor_progress(self):
-    while active_count() > 1:
+    while active_count() > 1 and not self.quit_now:
       self.report_progress()
-
-      if not self.from_stdin:
-        self.monitor_interaction()
+      self.monitor_interaction()
 
   def report_progress(self):
     for i, pq in enumerate(self.thread_report):
       p = self.thread_progress[i]
 
-      while True:
+      for _ in range(pq.maxsize):
 
         try:
           actions, current, resp, seconds = pq.get_nowait()
-          #logger.debug('actions reported: %s' % actions)
+          #logger.info('actions reported: %s' % '+'.join(actions))
 
         except Empty: 
           break
@@ -1335,33 +1496,48 @@ Please read the README inside for more examples and usage information.
           p.skip_count += 1
           continue
 
-        offset = (self.start + p.done_count * self.num_threads) + i + 1
+        if self.resume:
+          offset = p.done_count + self.resume[i]
+        else:
+          offset = p.done_count
+
+        offset = (offset * self.num_threads) + i + 1 + self.start
+
         p.current = current
         p.seconds[p.done_count % len(p.seconds)] = seconds
 
-        if 'ignore' not in actions:
+        msg = self.module.Response.logformat % (resp.compact()+(current, offset, resp))
+
+        if 'fail' in actions:
+          logger.error(msg)
+
+        elif 'ignore' not in actions:
+          logger.info(msg)
+
+        if 'fail' in actions:
+          p.fail_count += 1
+
+        elif 'retry' in actions:
+          continue
+
+        elif 'ignore' not in actions:
           p.hits_count += 1
-          logger.info('%-15s | %-25s \t | %5d | %s' % (resp.compact(), current, offset, resp))
 
           if self.log_dir:
-            filename = '%d_%s' % (offset, resp.compact().replace(' ', '_'))
+            filename = '%d_%s' % (offset, ':'.join(map(str, resp.compact())))
             with open('%s/%s.txt' % (self.log_dir, filename), 'w') as f:
               f.write(resp.dump())
 
           self.push_final(resp)
 
-        if 'retry' not in actions:
-          p.done_count += 1
+        p.done_count += 1
 
-        if 'fail' in actions:
-          p.fail_count += 1
-
-        if 'quit' in actions and 'retry' not in actions:
-          raise SystemExit
+        if 'quit' in actions:
+          self.quit_now = True
 
 
   def monitor_interaction(self):
-
+    from sys import stdin
     i, _, _ = select([stdin], [], [], .1)
     if not i: return
     command = i[0].readline().strip()
@@ -1379,7 +1555,7 @@ Please read the README inside for more examples and usage information.
        ''')
 
     elif command == 'q':
-      raise KeyboardInterrupt
+      self.quit_now = True
 
     elif command == 'p':
       self.paused = not self.paused
@@ -1396,21 +1572,30 @@ Please read the README inside for more examples and usage information.
 
     elif command.startswith('x'):
       _, arg = command.split(' ', 1)
-      self.update_actions(arg)
+      try:
+        self.update_actions(arg)
+      except ValueError:
+        logger.warn('usage: x actions:conditions')
 
     else: # show progress
       total_count = sum(p.done_count+p.skip_count for p in self.thread_progress)
       speed_avg = self.num_threads / (sum(sum(p.seconds) / len(p.seconds) for p in self.thread_progress) / self.num_threads)
-      remain_seconds = (self.total_size - total_count) / speed_avg
-      etc_time = datetime.now() + timedelta(seconds = remain_seconds)
+      if self.total_size >= maxint:
+        etc_time = 'inf'
+        remain_time = 'inf'
+      else:
+        remain_seconds = (self.total_size - total_count) / speed_avg
+        remain_time = pprint_seconds(remain_seconds, '%02d:%02d:%02d')
+        etc_seconds = datetime.now() + timedelta(seconds=remain_seconds)
+        etc_time = etc_seconds.strftime('%H:%M:%S')
 
       logger.info('Progress: {0:>3}% ({1}/{2}) | Speed: {3:.0f} r/s | ETC: {4} ({5} remaining) {6}'.format(
         total_count * 100/self.total_size,
         total_count,
         self.total_size,
         speed_avg,
-        etc_time.strftime('%H:%M:%S'),
-        pprint_seconds(remain_seconds, '%02d:%02d:%02d'),
+        etc_time,
+        remain_time,
         self.paused and '| Paused' or ''))
 
       if command == 'f':
@@ -1459,6 +1644,9 @@ class Response_Base:
     ('egrep', 'search for regex'),
     )
 
+  logformat = '%-5s %-4s | %-34s | %5s | %s'
+  logheader = ('code', 'size', 'candidate', 'num', 'mesg')
+
   def __init__(self, code, mesg, trace=None):
     self.code = code
     self.mesg = mesg
@@ -1466,7 +1654,7 @@ class Response_Base:
     self.size = len(self.mesg)
 
   def compact(self):
-    return '%s %d' % (self.code, self.size)
+    return self.code, self.size
 
   def __str__(self):
     return self.mesg
@@ -1515,32 +1703,47 @@ class TCP_Cache:
     )
 
   def __init__(self):
-    self.cache = {}
-    self.conn = None
+    self.cache = {} # {'10.0.0.1:22': ('root', conn1), '10.0.0.2:22': ('admin', conn2),
+    self.curr = None
 
   def __del__(self):
-    for _, c in self.cache.items():
+    for _, (_, c) in self.cache.items():
       c.close()
+    self.cache.clear()
 
-  def bind(self, *args, **kwargs):
-    # *args identify one connection in the cache while **kwargs are only options
+  def bind(self, host, port, *args, **kwargs):
+
+    hp = '%s:%s' % (host, port)
     key = ':'.join(args)
-    if key not in self.cache:
-      self.conn = self.cache[key] = self.connect(*args, **kwargs)
-    else:
-      self.conn = self.cache[key]
 
-    return self.conn.fp, self.conn.banner
+    if hp in self.cache:
+      k, c = self.cache[hp]
+
+      if key == k:
+        self.curr = hp, k, c
+        return c.fp, c.banner
+
+      else:
+        c.close()
+        del self.cache[hp]
+
+    self.curr = None
+
+    conn = self.connect(host, port, *args, **kwargs)
+
+    self.cache[hp] = (key, conn)
+    self.curr = hp, key, conn
+
+    return conn.fp, conn.banner
 
   def reset(self, **kwargs):
-    if self.conn:
-      for k, v in self.cache.items():
-        if v == self.conn:
-          del self.cache[k]
-          break
+    if self.curr:
+      hp, _, c = self.curr
 
-      self.conn.close()
-      self.conn = None
+      c.close()
+      del self.cache[hp]
+
+      self.curr = None
 
 # }}}
 
@@ -1560,8 +1763,8 @@ class FTP_login(TCP_Cache):
     )
 
   available_options = (
-    ('host', 'hostnames or subnets to target'),
-    ('port', 'ports to target [21]'),
+    ('host', 'target host'),
+    ('port', 'target port [21]'),
     ('user', 'usernames to test'),
     ('password', 'passwords to test'),
     ('tls', 'use TLS [0|1]'),
@@ -1616,75 +1819,7 @@ try:
 except ImportError:
   warnings.append('paramiko')
 
-class SSH_Connection(TCP_Connection):
-
-  def __init__(self, host, port, user, fp):
-    self.host = host
-    self.port = port
-    self.fp = fp
-    self.banner = fp.remote_version
-
-    self.user = user
-    self.ctime = time()
-
-class SSH_Cache(TCP_Cache):
-
-  lock = Lock()
-  count = {} # '10.0.0.1:22': 9, '10.0.0.2:222': 10
-
-  def __del__(self):
-    for k, pool in self.cache.items():
-      for u, c in pool.items():
-        with self.lock:
-          self.count[k] -= 1
-        c.close()
-
-  def bind(self, host, port, user, max_conn):
-
-    hp = '%s:%s' % (host, port)
-    if hp not in self.cache:
-      self.cache[hp] = {}
-
-      with self.lock:
-        if hp not in self.count:
-          self.count[hp] = 0
-
-    while True:
-      with self.lock:
-        if self.count[hp] < int(max_conn):
-          if user not in self.cache[hp]:
-            self.count[hp] += 1
-          break
-
-      if self.cache[hp]:
-        candidates = [(k, c.ctime) for k, c in self.cache[hp].items() if k != user]
-        if candidates:
-          u, _ = min(candidates, key=lambda x: x[1])
-          c = self.cache[hp].pop(u)
-          c.close()
-        break
-
-    if user not in self.cache[hp]:
-      self.conn = self.cache[hp][user] = self.connect(host, port, user)
-    else:
-      self.conn = self.cache[hp][user]
-
-    return self.conn.fp, self.conn.banner
-
-  def reset(self, **kwargs):
-    if self.conn:
-      hp = '%s:%s' % (self.conn.host, self.conn.port)
-
-      if self.conn.user in self.cache[hp]:
-        with self.lock:
-          self.count[hp] -= 1
-
-        self.cache[hp].pop(self.conn.user)
-
-      self.conn.close()
-      self.conn = None
-
-class SSH_login(SSH_Cache):
+class SSH_login(TCP_Cache):
   '''Brute-force SSH'''
 
   usage_hints = (
@@ -1692,14 +1827,13 @@ class SSH_login(SSH_Cache):
     )
 
   available_options = (
-    ('host', 'hostnames or subnets to target'),
-    ('port', 'ports to target [22]'),
+    ('host', 'target host'),
+    ('port', 'target port [22]'),
     ('user', 'usernames to test'),
     ('password', 'passwords to test'),
     ('auth_type', 'auth type to use [password|keyboard-interactive]'),
-    ('max_conn', 'maximum concurrent connections per host:port [10]'),
     )
-  available_options += SSH_Cache.available_options
+  available_options += TCP_Cache.available_options
 
   Response = Response_Base
 
@@ -1707,11 +1841,11 @@ class SSH_login(SSH_Cache):
     fp = paramiko.Transport('%s:%s' % (host, int(port)))
     fp.start_client()
 
-    return SSH_Connection(host, port, user, fp)
+    return TCP_Connection(fp, fp.remote_version)
 
-  def execute(self, host, port='22', user=None, password=None, auth_type='password', persistent='1', max_conn='10'):
+  def execute(self, host, port='22', user=None, password=None, auth_type='password', persistent='1'):
 
-    fp, banner = self.bind(host, port, user, max_conn)
+    fp, banner = self.bind(host, port, user)
 
     try:
       if user is not None and password is not None:
@@ -1751,8 +1885,8 @@ class Telnet_login(TCP_Cache):
     )
 
   available_options = (
-    ('host', 'hostnames or subnets to target'),
-    ('port', 'ports to target [23]'),
+    ('host', 'target host'),
+    ('port', 'target port [23]'),
     ('inputs', 'list of values to input'),
     ('prompt_re', 'regular expression to match prompts [\w+]'),
     ('timeout', 'seconds to wait for a response and for prompt_re to match received data [20]'),
@@ -1807,8 +1941,8 @@ class SMTP_Base(TCP_Cache):
   available_options = TCP_Cache.available_options
   available_options += (
     ('timeout', 'seconds to wait for a response [10]'),
-    ('host', 'hostnames or subnets to target'),
-    ('port', 'ports to target [25]'),
+    ('host', 'target host'),
+    ('port', 'target port [25]'),
     ('ssl', 'use SSL [0|1]'),
     ('helo', 'helo or ehlo command to send after connect [skip]'),
     ('starttls', 'send STARTTLS [0|1]'),
@@ -1953,8 +2087,8 @@ class Finger_lookup:
     )
 
   available_options = (
-    ('host', 'hostnames or subnets to target'),
-    ('port', 'ports to target [79]'),
+    ('host', 'target host'),
+    ('port', 'target port [79]'),
     ('user', 'usernames to test'),
     ('timeout', 'seconds to wait for a response [5]'),
     )
@@ -2008,8 +2142,8 @@ class LDAP_login:
     )
 
   available_options = (
-    ('host', 'hostnames or subnets to target'),
-    ('port', 'ports to target [389]'),
+    ('host', 'target host'),
+    ('port', 'target port [389]'),
     ('binddn', 'usernames to test'),
     ('bindpw', 'passwords to test'),
     ('basedn', 'base DN for search'),
@@ -2021,7 +2155,7 @@ class LDAP_login:
 
   def execute(self, host, port='389', binddn='', bindpw='', basedn='', ssl='0'):
     uri = 'ldap%s://%s:%s' % ('s' if ssl != '0' else '', host, port)
-    cmd = ['ldapsearch', '-H', uri, '-e', 'ppolicy', '-D', binddn, '-w', bindpw, '-b', basedn]
+    cmd = ['ldapsearch', '-H', uri, '-e', 'ppolicy', '-D', binddn, '-w', bindpw, '-b', basedn, '-s', 'one']
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env={'LDAPTLS_REQCERT': 'never'})
     out = p.stdout.read()
     err = p.stderr.read()
@@ -2051,39 +2185,45 @@ class SMB_login(TCP_Cache):
 
   usage_hints = (
     """%prog host=10.0.0.1 user=FILE0 password=FILE1 0=logins.txt 1=passwords.txt"""
-    """ -x ignore:fgrep=STATUS_LOGON_FAILURE""",
+    """ -x ignore:fgrep='unknown user name or bad password'""",
     )
   
   available_options = (
-    ('host', 'hostnames or subnets to target'),
-    ('port', 'ports to target [139]'),
+    ('host', 'target host'),
+    ('port', 'target port [139]'),
     ('user', 'usernames to test'),
     ('password', 'passwords to test'),
     ('password_hash', "LM/NT hashes to test, at least one hash must be provided ('lm:nt' or ':nt' or 'lm:')"),
-    ('domain', 'domains to test'),
+    ('domain', 'domain to test'),
     )
   available_options += TCP_Cache.available_options
 
-  Response = Response_Base
+  class Response(Response_Base):
+    logformat = '%-8s %-4s | %-34s | %5s | %s'
 
   # ripped from medusa smbnt.c
   error_map = {
-    0xFF: 'UNKNOWN_ERROR_CODE',
-    0x00: 'STATUS_SUCCESS',
-    0x0D: 'STATUS_INVALID_PARAMETER',
-    0x5E: 'STATUS_NO_LOGON_SERVERS',
-    0x6D: 'STATUS_LOGON_FAILURE',
-    0x6E: 'STATUS_ACCOUNT_RESTRICTION',
-    0x6F: 'STATUS_INVALID_LOGON_HOURS',
-    0x70: 'STATUS_INVALID_WORKSTATION',
-    0x71: 'STATUS_PASSWORD_EXPIRED',
-    0x72: 'STATUS_ACCOUNT_DISABLED',
-    0x5B: 'STATUS_LOGON_TYPE_NOT_GRANTED',
-    0x8D: 'STATUS_TRUSTED_RELATIONSHIP_FAILURE',
-    0x93: 'STATUS_ACCOUNT_EXPIRED',
-    0x24: 'STATUS_PASSWORD_MUST_CHANGE',
-    0x34: 'STATUS_ACCOUNT_LOCKED_OUT',
-    0x01: 'AS400_STATUS_LOGON_FAILURE',
+    0xffff: 'UNKNOWN_ERROR_CODE',
+    0x0000: 'STATUS_SUCCESS',
+    0x000d: 'STATUS_INVALID_PARAMETER',
+    0x005e: 'STATUS_NO_LOGON_SERVERS',
+    0x006d: 'STATUS_LOGON_FAILURE',
+    0x006e: 'STATUS_ACCOUNT_RESTRICTION',
+    0x006f: 'STATUS_INVALID_LOGON_HOURS',
+    0x0002: 'STATUS_INVALID_LOGON_HOURS (LM Authentication)',
+    0x0070: 'STATUS_INVALID_WORKSTATION',
+    0x0002: 'STATUS_INVALID_WORKSTATION (LM Authentication)',
+    0x0071: 'STATUS_PASSWORD_EXPIRED',
+    0x0072: 'STATUS_ACCOUNT_DISABLED',
+    0x015b: 'STATUS_LOGON_TYPE_NOT_GRANTED',
+    0x018d: 'STATUS_TRUSTED_RELATIONSHIP_FAILURE',
+    0x0193: 'STATUS_ACCOUNT_EXPIRED',
+    0x0002: 'STATUS_ACCOUNT_EXPIRED_OR_DISABLED (LM Authentication)',
+    0x0224: 'STATUS_PASSWORD_MUST_CHANGE',
+    0x0002: 'STATUS_PASSWORD_MUST_CHANGE (LM Authentication)',
+    0x0234: 'STATUS_ACCOUNT_LOCKED_OUT (No LM Authentication Code)',
+    0x0001: 'AS400_STATUS_LOGON_FAILURE',
+    0x0064: 'The machine you are logging onto is protected by an authentication firewall.',
   }
   
   def connect(self, host, port):
@@ -2097,44 +2237,48 @@ class SMB_login(TCP_Cache):
     fp, _ = self.bind(host, port)
 
     try:
-      if user is not None:
-        if password is not None:
-          fp.login(user, password, domain)
-
-        else:
+      if user is None:
+        fp.login('', '') # to get computer name
+        fp.login_standard('', '') # to get workgroup or domain (Primary Domain)
+      else:
+        if password is None:
           lmhash, nthash = password_hash.split(':')
           fp.login(user, '', domain, lmhash, nthash)
 
+        else:
+          fp.login(user, password, domain)
+
       logger.debug('No error')
-      code, mesg = '0', fp.get_server_name()
+      code, mesg = '0', '%s\\%s (%s)' % (fp.get_server_domain(), fp.get_server_name(), fp.get_server_os())
 
       self.reset()
 
     except impacket_smb.SessionError as e:
-      code = '%x-%x' % (e.error_class, e.error_code)
-      mesg = self.error_map.get(e.error_code, '')
+      code = '%04x%04x' % (e.error_class, e.error_code)
 
-      error_class = e.error_classes.get(e.error_class, None) # (ERRNT, {})
+      error_class = e.error_classes.get(e.error_class, None) # -> ("ERRNT", nt_msgs)
       if error_class:
-        class_str = error_class[0] # 'ERRNT'
-        error_tuple = error_class[1].get(e.error_code, None) # ('ERRnoaccess', 'Access denied.') or None
+        class_str = error_class[0] # "ERRNT"
+        error_tuple = error_class[1].get(e.error_code, None) # -> ("STATUS_LOGON_FAILURE","Logon failure: unknown user name or bad password.") or None
 
         if error_tuple:
-          mesg += ' - %s %s' % error_tuple
+          mesg = '%s %s' % error_tuple
         else:
-          mesg += ' - %s' % class_str
+          mesg = '%s' % class_str
+
+      else:
+        mesg = self.error_map.get(e.error_code & 0x0000fffff, '')
 
     if persistent == '0':
       self.reset()
 
     return self.Response(code, mesg)
 
-
 class DCE_Connection(TCP_Connection):
 
   def __init__(self, fp, smbt):
-    self.fp = fp
     self.smbt = smbt
+    TCP_Connection.__init__(self, fp)
 
   def close(self):
     self.smbt.get_socket().close()
@@ -2143,14 +2287,16 @@ class SMB_lookupsid(TCP_Cache):
   '''Brute-force SMB SID-lookup'''
 
   usage_hints = (
-    '''seq 500 2000 | %prog host=10.0.0.1 sid=S-1-5-21-1234567890-1234567890-1234567890 rid=FILE0 0=- -x ignore:code=1''',
+    '''%prog host=10.0.0.1 sid=S-1-5-21-1234567890-1234567890-1234567890 rid=RANGE0 0=int:500-2000 -x ignore:code=1''',
     )
 
   available_options = (
-    ('host', 'hostnames or subnets to target'),
-    ('port', 'ports to target [139]'),
+    ('host', 'target host'),
+    ('port', 'target port [139]'),
     ('sid', 'SID to test'),
     ('rid', 'RID to test'),
+    ('user', 'username to use if auth required'),
+    ('password', 'password to use if auth required'),
     )
   available_options += TCP_Cache.available_options
 
@@ -2212,8 +2358,8 @@ class POP_login(TCP_Cache):
     )
 
   available_options = (
-    ('host', 'hostnames or subnets to target'),
-    ('port', 'ports to target [110]'),
+    ('host', 'target host'),
+    ('port', 'target port [110]'),
     ('user', 'usernames to test'),
     ('password', 'passwords to test'),
     ('ssl', 'use SSL [0|1]'),
@@ -2264,8 +2410,8 @@ class POP_passd:
     )
 
   available_options = (
-    ('host', 'hostnames or subnets to target'),
-    ('port', 'ports to target [106]'),
+    ('host', 'target host'),
+    ('port', 'target port [106]'),
     ('user', 'usernames to test'),
     ('password', 'passwords to test'),
     ('timeout', 'seconds to wait for a response [10]'),
@@ -2313,8 +2459,8 @@ class IMAP_login:
     )
 
   available_options = (
-    ('host', 'hostnames or subnets to target'),
-    ('port', 'ports to target [143]'),
+    ('host', 'target host'),
+    ('port', 'target port [143]'),
     ('user', 'usernames to test'),
     ('password', 'passwords to test'),
     ('ssl', 'use SSL [0|1]'),
@@ -2398,8 +2544,8 @@ class VMauthd_login(TCP_Cache):
     )
 
   available_options = (
-    ('host', 'hostnames or subnets to target'),
-    ('port', 'ports to target [902]'),
+    ('host', 'target host'),
+    ('port', 'target port [902]'),
     ('user', 'usernames to test'),
     ('password', 'passwords to test'),
     ('ssl', 'use SSL [1|0]'),
@@ -2457,8 +2603,8 @@ class MySQL_login:
     )
   
   available_options = (
-    ('host', 'hostnames or subnets to target'),
-    ('port', 'ports to target [3306]'),
+    ('host', 'target host'),
+    ('port', 'target port [3306]'),
     ('user', 'usernames to test'),
     ('password', 'passwords to test'),
     ('timeout', 'seconds to wait for a response [10]'),
@@ -2479,78 +2625,50 @@ class MySQL_login:
     code, mesg = resp
     return self.Response(code, mesg)
 
+class MySQL_query(TCP_Cache):
+  '''Brute-force MySQL queries'''
+
+  usage_hints = (
+    '''%prog host=10.0.0.1 user=root password=s3cr3t query="select length(load_file('/home/adam/FILE0'))" 0=files.txt -x ignore:size=0''',
+    )
+
+  available_options = (
+    ('host', 'target host'),
+    ('port', 'target port [3306]'),
+    ('user', 'username to use'),
+    ('password', 'password to use'),
+    ('query', 'SQL query to execute'),
+    )
+
+  available_actions = ()
+
+  Response = Response_Base
+
+  def connect(self, host, port, user, password):
+    fp = _mysql.connect(host=host, port=int(port), user=user, passwd=password) # db=db
+    return TCP_Connection(fp)
+
+  def execute(self, host, port='3306', user='', password='', query='select @@version'):
+
+    fp, _ = self.bind(host, port, user, password)
+
+    fp.query(query)
+
+    rs = fp.store_result()
+    rows = rs.fetch_row(10, 0)
+
+    code, mesg = '0', '\n'.join(', '.join(map(str, r)) for r in filter(any, rows))
+    return self.Response(code, mesg)
+
 # }}}
 
 # MSSQL {{{
 # I did not use pymssql because neither version 1.x nor 2.0.0b1_dev were multithreads safe (they all segfault)
-class MSSQL:
-  # ripped from medusa mssql.c
-  hdr = '\x02\x00\x02\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
-        '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
-
-  pt2 = '\x30\x30\x30\x30\x30\x30\x61\x30\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
-        '\x00\x00\x00\x20\x18\x81\xb8\x2c\x08\x03\x01\x06\x0a\x09\x01\x01\x00\x00\x00\x00\x00\x00' \
-        '\x00\x00\x00\x73\x71\x75\x65\x6c\x64\x61\x20\x31\x2e\x30\x00\x00\x00\x00\x00\x00\x00\x00' \
-        '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0b\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
-        '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
-
-  pt3 = '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
-        '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
-        '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
-        '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
-        '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
-        '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
-        '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
-        '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
-        '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
-        '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
-        '\x00\x00\x00\x00\x04\x02\x00\x00\x4d\x53\x44\x42\x4c\x49\x42\x00\x00\x00\x07\x06\x00\x00' \
-        '\x00\x00\x0d\x11\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
-        '\x00\x00\x00\x00\x00\x00'
-
-  langp = '\x02\x01\x00\x47\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00' \
-          '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
-          '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x30\x30\x30\x00\x00' \
-          '\x00\x03\x00\x00\x00'
-
-  def connect(self, host, port, timeout):
-    self.fp = socket.create_connection((host, port), timeout)
-
-  def login(self, user, password):
-    MAX_LEN = 30
-    user_len = len(user)
-    password_len = len(password)
-    data = self.hdr + user[:MAX_LEN] + '\x00' * (MAX_LEN - user_len) + chr(user_len) + \
-      password[:MAX_LEN] + '\x00' * (MAX_LEN - password_len) + chr(password_len) + self.pt2 + chr(password_len) + \
-      password[:MAX_LEN] + '\x00' * (MAX_LEN - password_len) + self.pt3
-
-    self.fp.sendall(data)
-    self.fp.sendall(self.langp)
-
-    resp = self.fp.recv(1024)
-    code, size = self.parse(resp)
-
-    return code, size
-
-  def parse(self, resp):
-    i = 8
-    while True:
-      resp = resp[i:]
-      code, size = unpack('<cH', resp[:3])
-      #logger.debug('code: %s / size: %d' % (code.encode('hex'), size))
-
-      if code == '\xfd': # Done
-        break
-
-      if code in ('\xaa', '\xab') : # Error or Info message
-        num, state, severity, msg_len = unpack('IBBB', resp[3:10])
-        msg = resp[11:11+msg_len]
-        return num, msg
-
-      i = size + 3
-    
-    raise Exception('Failed to parse response')
-
+try:
+  from impacket import tds
+  from impacket.tds import TDS_ERROR_TOKEN, TDS_LOGINACK_TOKEN
+except ImportError:
+  warnings.append('impacket')
 class MSSQL_login:
   '''Brute-force MSSQL'''
 
@@ -2559,22 +2677,44 @@ class MSSQL_login:
     )
 
   available_options = (
-    ('host', 'hostnames or subnets to target'),
-    ('port', 'ports to target [1433]'),
+    ('host', 'target host'),
+    ('port', 'target port [1433]'),
     ('user', 'usernames to test'),
     ('password', 'passwords to test'),
-    ('timeout', 'seconds to wait for a response [10]'),
+    ('windows_auth', 'use Windows auth [0|1]'),
+    ('domain', 'domain to test []'),
+    ('password_hash', "LM/NT hashes to test ('lm:nt' or ':nt')"),
+    #('timeout', 'seconds to wait for a response [10]'),
     )
   available_actions = ()
 
   Response = Response_Base
 
-  def execute(self, host, port='1433', user='', password='', timeout='10'):
-    m = MSSQL()
-    m.connect(host, int(port), int(timeout))
-    code, mesg = m.login(user, password)
-    return self.Response(code, mesg)
+  def execute(self, host, port='1433', user='', password='', windows_auth='0', domain='', password_hash=None): #, timeout='10'):
 
+    fp = tds.MSSQL(host, int(port))
+    fp.connect()
+
+    if windows_auth == '0':
+      r = fp.login(None, user, password, None, None, False)
+    else:
+      r = fp.login(None, user, password, domain, password_hash, True)
+
+    if not r:
+      key = fp.replies[TDS_ERROR_TOKEN][0]
+
+      code = key['Number']
+      mesg = key['MsgText'].decode('utf-16le')
+
+    else:
+      key = fp.replies[TDS_LOGINACK_TOKEN][0]
+
+      code = '0'
+      mesg = '%s (%d%d %d%d)' % (key['ProgName'].decode('utf-16le'), key['MajorVer'], key['MinorVer'], key['BuildNumHi'], key['BuildNumLow'])
+
+    fp.disconnect()
+
+    return self.Response(code, mesg)
 # }}}
 
 # Oracle {{{
@@ -2600,7 +2740,8 @@ class Oracle_login:
     )
   available_actions = ()
 
-  Response = Response_Base
+  class Response(Response_Base):
+    logformat = '%-9s %-4s | %-34s | %5s | %s'
 
   def execute(self, host, port='1521', user='', password='', sid=''):
     dsn = cx_Oracle.makedsn(host, port, sid)
@@ -2629,8 +2770,8 @@ class Pgsql_login:
     )
   
   available_options = (
-    ('host', 'hostnames or subnets to target'),
-    ('port', 'ports to target [5432]'),
+    ('host', 'target host'),
+    ('port', 'target port [5432]'),
     ('user', 'usernames to test'),
     ('password', 'passwords to test'),
     ('database', 'databases to test [postgres]'),
@@ -2680,12 +2821,15 @@ class Controller_HTTP(Controller):
 
 class Response_HTTP(Response_Base):
 
+  logformat = '%-4s %-13s | %-32s | %5s | %s'
+  logheader = ('code', 'size:clen', 'candidate', 'num', 'mesg')
+
   def __init__(self, code, response, trace=None, content_length=-1):
     self.content_length = content_length
     Response_Base.__init__(self, code, response, trace)
 
   def compact(self):
-    return '%s %s' % (self.code, '%d:%d' % (self.size, self.content_length))
+    return self.code, '%d:%d' % (self.size, self.content_length)
 
   def __str__(self):
     i = self.mesg.rfind('HTTP/', 0, 5000)
@@ -2726,8 +2870,8 @@ class HTTP_fuzz(TCP_Cache):
 
   available_options = (
     ('url', 'main url to target (scheme://host[:port]/path?query)'),
-    #('host', 'hostnames or subnets to target'),
-    #('port', 'ports to target'),
+    #('host', 'target host'),
+    #('port', 'target port'),
     #('scheme', 'scheme [http | https]'),
     #('path', 'web path [/]'),
     #('query', 'query string'),
@@ -2991,8 +3135,8 @@ class VNC_login:
     )
   
   available_options = (
-    ('host', 'hostnames or subnets to target'),
-    ('port', 'ports to target [5900]'),
+    ('host', 'target host'),
+    ('port', 'target port [5900]'),
     ('password', 'passwords to test'),
     ('timeout', 'seconds to wait for a response [10]'),
     )
@@ -3042,12 +3186,13 @@ def dns_query(server, timeout, protocol, qname, qtype, qclass):
   return response
 
 def generate_tld():
+  from itertools import product
   gtld = [
     'aero', 'arpa', 'asia', 'biz', 'cat', 'com', 'coop', 'edu',
     'gov', 'info', 'int', 'jobs', 'mil', 'mobi', 'museum', 'name',
     'net', 'org', 'pro', 'tel', 'travel']
 
-  cctld = [''.join(i) for i in product(*[ascii_lowercase]*2)]
+  cctld = [''.join(i) for i in product(*[string.ascii_lowercase]*2)]
   tld = gtld + cctld
   return tld, len(tld)
 
@@ -3340,8 +3485,8 @@ class SNMP_login:
     )
   
   available_options = (
-    ('host', 'hostnames or subnets to target'),
-    ('port', 'ports to target [161]'),
+    ('host', 'target host'),
+    ('port', 'target port [161]'),
     ('version', 'SNMP version to use [2|3|1]'),
     #('security_name', 'SNMP v1/v2 username, for most purposes it can be any arbitrary string [test-agent]'),
     ('community', 'SNMPv1/2c community names to test [public]'),
@@ -3456,6 +3601,62 @@ class Keystore_pass:
 
 # }}}
 
+# TCP Fuzz {{{
+class TCP_fuzz:
+  '''Fuzz TCP services'''
+
+  usage_hints = (
+    '''%prog host=10.0.0.1 data=RANGE0 0=hex:0x00-0xffffff''',
+    )
+
+  available_options = (
+    ('host', 'target host'),
+    ('port', 'target port'),
+    ('timeout', 'seconds to wait for a response [10]'),
+    )
+  available_actions = ()
+
+  Response = Response_Base
+
+  def execute(self, host, port, data='', timeout='2'):
+    fp = socket.create_connection((host, port), int(timeout))
+    fp.send(data.decode('hex'))
+    resp = fp.recv(1024)
+    fp.close()
+
+    code = 0
+    mesg = resp.encode('hex')
+
+    return self.Response(code, mesg)
+
+# }}}
+
+# Dummy Test {{{
+class Dummy_test:
+  '''Testing module'''
+
+  usage_hints = (
+    """%prog data=RANGE0 0=hex:0x00-0xffff""",
+    """%prog data=PROG0 0='seq 0 80'""",
+    """%prog data=PROG0 0='mp64.bin -i ?l?l?l',$(mp64.bin --combination -i ?l?l?l)""",
+    )
+
+  available_options = (
+    ('data', 'data to test'),
+    )
+  available_actions = ()
+
+  Response = Response_Base
+
+  def execute(self, data):
+    code = 0
+    mesg = data
+    #sleep(.01)
+
+    return self.Response(code, mesg)
+
+# }}}
+
 # modules {{{
 modules = [
   ('ftp_login', (Controller, FTP_login)),
@@ -3476,6 +3677,7 @@ modules = [
   ('mssql_login', (Controller, MSSQL_login)),
   ('oracle_login', (Controller, Oracle_login)),
   ('mysql_login', (Controller, MySQL_login)),
+  ('mysql_query', (Controller, MySQL_query)),
   #'rdp_login', 
   ('pgsql_login', (Controller, Pgsql_login)),
   ('vnc_login', (Controller, VNC_login)),
@@ -3486,13 +3688,16 @@ modules = [
   
   ('unzip_pass', (Controller, Unzip_pass)),
   ('keystore_pass', (Controller, Keystore_pass)),
+
+  ('tcp_fuzz', (Controller, TCP_fuzz)),
+  ('dummy_test', (Controller, Dummy_test)),
   ]
 
 dependencies = {
   'paramiko': [('ssh_login',), 'http://www.lag.net/paramiko/', '1.7.7.1'],
   'pycurl': [('http_fuzz',), 'http://pycurl.sourceforge.net/', '7.19.0'],
   'openldap': [('ldap_login',), 'http://www.openldap.org/', '2.4.24'],
-  'impacket': [('smb_login','smb_lookupsid'), 'http://oss.coresecurity.com/projects/impacket.html', 'svn#414'],
+  'impacket': [('smb_login','smb_lookupsid','mssql_login'), 'http://oss.coresecurity.com/projects/impacket.html', 'svn#765'],
   'cx_Oracle': [('oracle_login',), 'http://cx-oracle.sourceforge.net/', '5.1.1'],
   'mysql-python': [('mysql_login',), 'http://sourceforge.net/projects/mysql-python/', '1.2.3'],
   'psycopg': [('pgsql_login',), 'http://initd.org/psycopg/', '2.4.5'],
@@ -3535,7 +3740,7 @@ Available modules:
 
   # dependencies
   abort = False
-  for w in warnings:
+  for w in set(warnings):
     mods, url, ver = dependencies[w]
     if name in mods:
       print('ERROR: %s %s (%s) is required to run %s.' % (w, ver, url, name))
