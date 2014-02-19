@@ -14,4 +14,4 @@
 
 override_dh_auto_install:
 	dh_installdirs
-	install patator_v0.4.py $(CURDIR)/debian/patator/usr/bin/patator
+	install patator_v0.5.py $(CURDIR)/debian/patator/usr/bin/patator
