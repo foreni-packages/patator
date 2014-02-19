@@ -1,3 +1,9 @@
+patator (0.5-0kali1) kali; urgency=low
+
+  * Upstream import
+
+ -- Mati Aharoni <muts@kali.org>  Tue, 18 Feb 2014 20:20:29 -0500
+
 patator (0.4-1kali1) kali; urgency=low
 
   * Updated watch file
